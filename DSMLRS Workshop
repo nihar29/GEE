@@ -1,0 +1,306 @@
+// AUTOMATICALLY GENERATED: imported vars from saved link.
+var CONVERT_TO_IMPORT = (
+[{"type":"geometry","name":"roi","record":{"geometries":[{"type":"Polygon","coordinates":[[[85.1215518566677,19.459948903248037],[85.1874698254177,19.481959709417957],[85.22729526487082,19.528560951745952],[85.2643741222927,19.57514875456641],[85.36599765744894,19.630777645835792],[85.4566348644802,19.673456526986794],[85.50744663205832,19.699316986599527],[85.56924472776144,19.727758665953214],[85.57611118283957,19.778165562254486],[85.5829776379177,19.83889114965057],[85.56787143674582,19.880222952160782],[85.54315219846457,19.97318006971053],[85.37561069455832,20.174398950418542],[84.82904087033957,19.889262847798456],[85.0721133801052,19.537620744577225]]],"geodesic":true,"evenOdd":true}],"displayProperties":[],"properties":{},"color":"#d63000","mode":"Geometry","shown":false,"locked":false}}])
+
+// AUTOMATICALLY GENERATED: location from saved link.
+Map.setCenter(85.20600925412862, 19.81757528099411, 7)
+
+Map.centerObject(roi)
+
+var StartDate= ee.Date('2022-05-01');
+var EndDate= ee.Date('2022-05-31');
+
+var collection1= ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode','IW'))
+  .filterDate(StartDate,EndDate)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING')) 
+  .filter(ee.Filter.eq('resolution_meters',10))
+ .filterBounds(roi)
+ //.median()
+ 
+ // Function to convert from dB
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select(0).divide(10.0));
+}
+
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+
+//Function to crop the image collection//
+function clp(img) {
+  return img.clip(roi);
+}
+
+
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+  //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(img.subtract(dir_mean)));
+  return(result.arrayFlatten([['VV']]));
+}
+
+var vis= {min:-23.057879151995206,max:1.0755666373123107}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+var natural= collection1.map(toNatural)
+var lee_applied= natural.map(RefinedLee)
+var db_n= lee_applied.map(toDB)
+var db= db_n.mean()
+var db1= collection1.mean()
+
+Map.addLayer(db.select('VV').clip(roi),vis,'SAR Image')
+
+var chart =ui.Chart.image.histogram({image: db, region: roi, scale: 100});
+
+print(chart)
+
+var masked= db.lt(-15)
+var wat= db.mask(masked)
+var clipped_wat= wat.clip(roi)
+
+Map.addLayer(clipped_wat,{palette:'blue'},'water')
+//////////////////////////////////////////////////////////////////////////
+var chart1 =ui.Chart.image.histogram({image: db1, region: roi, scale: 80});
+
+print(chart1)
+//////////////////////////////////////////////////////////////////////
+var StartDate= ee.Date('2022-01-01');
+var EndDate= ee.Date('2022-12-31');
+//////////////////////////////////////////////////////////////////////////////////////////////
+/**
+ * Function to mask clouds using the Sentinel-2 QA band 
+ * @param {ee.Image} image Sentinel-2 image
+ * @return {ee.Image} cloud masked Sentinel-2 image
+ */
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate(StartDate,EndDate)
+                  // Pre-filter to get less cloudy granules.
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',20))
+                  .filterBounds(roi)
+                  .map(clp)
+                  .map(maskS2clouds);
+
+var visualization = {
+  min: 0.0,
+  max: 0.3,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+Map.addLayer(dataset.mean(), visualization, 'RGB');
+var composite= dataset.mean()
+var b1= composite.select('B1')
+var b2= composite.select('B8')
+var img= b2.addBands(b1)
+Map.addLayer(img)
+// sample N points from the 2-band image
+var values = img.sample({region: roi, scale: 80, numPixels: 5000, geometries: true}) 
+ 
+Map.addLayer(values.style({ color: 'red', pointSize: 2 }), {}, 'samples')
+ 
+// plot sampled features as a scatter chart
+var chart = ui.Chart.feature.byFeature(values, 'B1', ['B8'])
+  .setChartType('ScatterChart')
+  .setOptions({ pointSize: 2, pointColor: 'red', width: 300, height: 300, titleX: 'Band1', titleY: 'Band2' })
+   
+print(chart) 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Compute the histogram of the Image
+var histogram = db.select('VV').reduceRegion({
+  reducer: ee.Reducer.histogram(255, 2)
+      .combine('mean', null, true)
+      .combine('variance', null, true), 
+  geometry: roi, 
+  scale: 500,
+  bestEffort: true
+});
+
+// Otsu Algorithm
+var otsu = function(histogram) {
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var size = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean = sum.divide(total);
+  
+  var indices = ee.List.sequence(1, size);
+  
+  // Compute between sum of squares, where each mean partitions the data.
+  var bss = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans = means.slice(0, 0, i);
+    var aMean = aMeans.multiply(aCounts)
+        .reduce(ee.Reducer.sum(), [0]).get([0])
+        .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+           bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+  //print(ui.Chart.array.values(ee.Array(bss), 0, means));
+  // Return the mean value corresponding to the maximum BSS.
+  return means.sort(bss).get([-1]);
+};
+
+var threshold = otsu(histogram.get('VV_histogram'));
+//print('threshold', threshold);
+
+// Return the DN that maximizes interclass variance in B5 (in the region).
+var otsu = function(histogram) {
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var size = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean = sum.divide(total);
+  
+  var indices = ee.List.sequence(1, size);
+  
+  // Compute between sum of squares, where each mean partitions the data.
+  var bss = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans = means.slice(0, 0, i);
+    var aMean = aMeans.multiply(aCounts)
+        .reduce(ee.Reducer.sum(), [0]).get([0])
+        .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+           bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+  
+  print(ui.Chart.array.values(ee.Array(bss), 0, means));
+  
+  // Return the mean value corresponding to the maximum BSS.
+  return means.sort(bss).get([-1]);
+};
+
+var threshold = otsu(histogram.get('VV_histogram'));
+print('threshold', threshold);
+////////////////////////////////////////////////////////////////////////////////////////////////
+var classA = db.select('VV').lt(threshold);
+var clipped= classA.clip(roi)
+
+Map.addLayer(clipped.mask(classA).clip(roi), {palette: 'blue'}, 'class A');
+///////////////////////////////////////////////////////////////////////////////////////////////
+//Calculate the pixel area in square kilometer
+var area_veg = clipped.multiply(ee.Image.pixelArea())//.divide(1000*1000);
+
+//Reducing the statistics for your study area
+var stat = area_veg.reduceRegion ({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 100,
+  maxPixels: 1e9
+});
+
+//Get the sq km area for vegetation
+print ('Reservoir Area (in sq.m)', stat);
+
+
